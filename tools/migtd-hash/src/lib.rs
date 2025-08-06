@@ -22,6 +22,7 @@ pub fn calculate_servtd_hash(
     manifest: &[u8],
     mut image: File,
     is_ra_disabled: bool,
+    igvmformat: bool,
 ) -> Result<Vec<u8>, Error> {
     // Initialize the configurable fields of TD info structure.
     let manifest = serde_json::from_slice::<Manifest>(&manifest)?;
@@ -35,7 +36,7 @@ pub fn calculate_servtd_hash(
     };
 
     // Calculate the MRTD with MigTD image
-    td_info.build_mrtd(&mut image, MIGTD_IMAGE_SIZE);
+    td_info.build_mrtd(&mut image, MIGTD_IMAGE_SIZE, igvmformat);
     // Calculate RTMR0 and RTMR1
     td_info.build_rtmr_with_seperator(0);
     // Calculate RTMR2 with CFV

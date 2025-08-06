@@ -28,6 +28,8 @@ struct Config {
 
 fn main() {
     let config = Config::parse();
+    let imagename = config.image.clone();
+    let mut igvmformat = false;
 
     let image = File::open(config.image).unwrap_or_else(|e| {
         eprintln!("Failed to open MigTD image: {}", e);
@@ -38,11 +40,19 @@ fn main() {
         exit(1);
     });
 
-    let hash = calculate_servtd_hash(&manifest, image, config.test_disable_ra_and_accept_all)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to calculate hash: {:?}", e);
-            exit(1);
-        });
+    assert_eq!(imagename.contains(".igvm") || imagename.contains(".bin"), true);
+
+    if imagename.contains(".igvm") {
+        igvmformat = true;
+        // Currently tdvf/igvm images for windows are built with RA disabled, this feature will be enabled once RA is supported on windows
+        assert_eq!(config.test_disable_ra_and_accept_all, true);
+    }
+
+    let hash = calculate_servtd_hash(&manifest, image, config.test_disable_ra_and_accept_all, igvmformat)
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to calculate hash: {:?}", e);
+        exit(1);
+    });
 
     if let Some(output_file) = config.output_file {
         fs::write(output_file, &hash).unwrap_or_else(|e| {
