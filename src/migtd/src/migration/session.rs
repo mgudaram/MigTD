@@ -49,6 +49,27 @@ struct GhciWaitForRequestResponse {
     binding_handle: u64,
 }
 
+#[cfg(feature = "vmcall-raw")]
+fn parse_uuid(buf: &[u8]) -> [u64; 4] {
+    [
+        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+    ]
+}
+
+#[cfg(feature = "vmcall-raw")]
+fn parse_ghci_waitforrequest_response(buf: &[u8]) -> GhciWaitForRequestResponse {
+    GhciWaitForRequestResponse {
+        mig_request_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        migration_source: buf[8],
+        _pad: buf[9..16].try_into().unwrap(),
+        target_td_uuid: parse_uuid(&buf[16..48]),
+        binding_handle: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+    }
+}
+
 lazy_static! {
     pub static ref REQUESTS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 }
@@ -171,8 +192,8 @@ pub async fn wait_for_request() -> Result<MigrationInformation> {
 
             let (data_status, _data_length) = process_buffer(data_buffer);
 
-            let wfr: &GhciWaitForRequestResponse =
-                unsafe { &*(data_buffer.as_ptr().add(12) as *const GhciWaitForRequestResponse) };
+            let slice = &data_buffer[12..12 + 56];
+            let wfr = parse_ghci_waitforrequest_response(slice);
 
             let data_status_bytes = data_status.to_le_bytes();
             if data_status_bytes[0] != TDX_VMCALL_VMM_SUCCESS {
