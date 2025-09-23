@@ -157,6 +157,9 @@ pub enum MigrationResult {
     MutualAttestationError = 7,
     PolicyUnsatisfiedError = 8,
     InvalidPolicyError = 9,
+    VmmCanceled = 10,
+    VmmInternalError = 11,
+    UnsupportedOperationError = 12,
 }
 
 #[cfg(any(feature = "virtio-vsock", feature = "vmcall-vsock"))]

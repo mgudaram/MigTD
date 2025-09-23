@@ -236,7 +236,7 @@ pub struct MigrationInformation {
     // <Service.MigTD.ReportStatus>
     pub mig_request_id: u64,
     pub mig_info: MigtdStartMigrationInformation,
-    pub reportdata: [u64; 8],
+    pub reportdata: [u8; 64],
     pub logmaxlevel: u8,
 }
 
