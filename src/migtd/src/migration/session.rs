@@ -22,6 +22,8 @@ use tdx_tdcall::{
     tdx::{self, tdcall_servtd_wr},
     TdcallArgs,
 };
+#[cfg(feature = "vmcall-raw")]
+use tdx_tdcall::{tdreport::TdxReport, tdreport::TD_REPORT_ADDITIONAL_DATA_SIZE};
 use zerocopy::AsBytes;
 
 type Result<T> = core::result::Result<T, MigrationResult>;
@@ -30,6 +32,8 @@ use super::{data::*, *};
 use crate::ratls;
 
 const TDCALL_STATUS_SUCCESS: u64 = 0;
+#[cfg(feature = "vmcall-raw")]
+const PAGE_SIZE: u64 = 0x1_000;
 const TDCS_FIELD_MIG_DEC_KEY: u64 = 0x9810_0003_0000_0010;
 const TDCS_FIELD_MIG_ENC_KEY: u64 = 0x9810_0003_0000_0018;
 const TDCS_FIELD_MIG_VERSION: u64 = 0x9810_0001_0000_0020;
@@ -38,17 +42,26 @@ const GSM_FIELD_MIN_EXPORT_VERSION: u64 = 0x2000000100000001;
 const GSM_FIELD_MAX_EXPORT_VERSION: u64 = 0x2000000100000002;
 const GSM_FIELD_MIN_IMPORT_VERSION: u64 = 0x2000000100000003;
 const GSM_FIELD_MAX_IMPORT_VERSION: u64 = 0x2000000100000004;
+
+#[cfg(feature = "vmcall-raw")]
+#[repr(C, align(1024))]
+#[derive(Debug)]
+struct TdxReportBuf(TdxReport);
+
+#[cfg(feature = "vmcall-raw")]
+#[repr(C, align(64))]
+struct AdditionalDataBuf([u8; TD_REPORT_ADDITIONAL_DATA_SIZE]);
+
 #[cfg(feature = "vmcall-raw")]
 const TDX_VMCALL_VMM_SUCCESS: u8 = 1;
 
 #[cfg(feature = "vmcall-raw")]
-#[repr(C)]
-struct GhciWaitForRequestResponse {
-    mig_request_id: u64,
-    migration_source: u8,
-    _pad: [u8; 7],
-    target_td_uuid: [u64; 4],
-    binding_handle: u64,
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum DataStatusOperation {
+    StartMigration = 1,
+    GetReportData = 3,
+    EnableLogArea = 4,
 }
 
 #[cfg(feature = "vmcall-raw")]
@@ -59,17 +72,6 @@ fn parse_uuid(buf: &[u8]) -> [u64; 4] {
         u64::from_le_bytes(buf[16..24].try_into().unwrap()),
         u64::from_le_bytes(buf[24..32].try_into().unwrap()),
     ]
-}
-
-#[cfg(feature = "vmcall-raw")]
-fn parse_ghci_waitforrequest_response(buf: &[u8]) -> GhciWaitForRequestResponse {
-    GhciWaitForRequestResponse {
-        mig_request_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        migration_source: buf[8],
-        _pad: buf[9..16].try_into().unwrap(),
-        target_td_uuid: parse_uuid(&buf[16..48]),
-        binding_handle: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
-    }
 }
 
 lazy_static! {
@@ -192,42 +194,128 @@ pub async fn wait_for_request() -> Result<MigrationInformation> {
                 return Poll::Pending;
             }
 
-            let (data_status, _data_length) = process_buffer(data_buffer);
-
-            let slice = &data_buffer[12..12 + 56];
-            let wfr = parse_ghci_waitforrequest_response(slice);
+            let (data_status, data_length) = process_buffer(data_buffer);
 
             let data_status_bytes = data_status.to_le_bytes();
             if data_status_bytes[0] != TDX_VMCALL_VMM_SUCCESS {
                 return Poll::Pending;
             }
 
-            let request_id = wfr.mig_request_id;
-            VMCALL_MIG_REPORTSTATUS_FLAGS
-                .lock()
-                .insert(request_id, AtomicBool::new(false));
+            let operation: u8 = data_status_bytes[1];
+            if operation == DataStatusOperation::StartMigration as u8 {
+                let mut mig_request_id: u64 = 0;
+                // data_length should be MigRequestID + MigtdStartMigrationInformation
+                let expected_datalength =
+                    size_of_val(&mig_request_id) + size_of::<MigtdStartMigrationInformation>();
+                if data_length != expected_datalength as u32 {
+                    return Poll::Pending;
+                }
+                let slice = &data_buffer[12..12 + data_length as usize];
+                mig_request_id = u64::from_le_bytes(slice[0..8].try_into().unwrap());
+                let mig_info = MigtdStartMigrationInformation {
+                    migration_source: slice[8],
+                    _pad: slice[9..16].try_into().unwrap(),
+                    target_td_uuid: parse_uuid(&slice[16..48]),
+                    binding_handle: u64::from_le_bytes(slice[48..56].try_into().unwrap()),
+                };
 
-            let mut mig_info = MigtdMigrationInformation {
-                mig_request_id: request_id,
-                migration_source: wfr.migration_source,
-                _pad: [0, 0, 0, 0, 0, 0, 0],
-                target_td_uuid: [0, 0, 0, 0],
-                binding_handle: wfr.binding_handle,
-                mig_policy_id: 0,
-                communication_id: 0,
-            };
+                VMCALL_MIG_REPORTSTATUS_FLAGS
+                    .lock()
+                    .insert(mig_request_id, AtomicBool::new(false));
 
-            for i in 0..4 {
-                mig_info.target_td_uuid[i] = wfr.target_td_uuid[i];
-            }
+                let mig_info = MigrationInformation {
+                    operation,
+                    mig_request_id,
+                    mig_info,
+                    reportdata: [0; TD_REPORT_ADDITIONAL_DATA_SIZE],
+                    loglevel: [0; 8],
+                };
 
-            let mig_info = MigrationInformation { mig_info };
+                if REQUESTS.lock().contains(&mig_request_id) {
+                    Poll::Pending
+                } else {
+                    REQUESTS.lock().insert(mig_request_id);
+                    Poll::Ready(Ok(mig_info))
+                }
+            } else if operation == DataStatusOperation::GetReportData as u8 {
+                let mut reportdata: [u8; 64] = [0; 64];
+                let mut mig_request_id: u64 = 0;
+                // data_length should MigRequestID (+ optional REPORTDATA)
+                if data_length != size_of_val(&mig_request_id) as u32
+                    && data_length
+                        != (size_of_val(&mig_request_id) + TD_REPORT_ADDITIONAL_DATA_SIZE) as u32
+                {
+                    return Poll::Pending;
+                }
+                let slice = &data_buffer[12..12 + data_length as usize];
+                mig_request_id = u64::from_le_bytes(slice[0..8].try_into().unwrap());
+                let mig_info = MigtdStartMigrationInformation {
+                    migration_source: 0,
+                    _pad: [0, 0, 0, 0, 0, 0, 0],
+                    target_td_uuid: [0, 0, 0, 0],
+                    binding_handle: 0,
+                };
 
-            if REQUESTS.lock().contains(&request_id) {
-                Poll::Pending
+                if data_length
+                    == (size_of_val(&mig_request_id) + TD_REPORT_ADDITIONAL_DATA_SIZE) as u32
+                {
+                    reportdata = slice[8..72].try_into().unwrap();
+                }
+
+                VMCALL_MIG_REPORTSTATUS_FLAGS
+                    .lock()
+                    .insert(mig_request_id, AtomicBool::new(false));
+
+                let mig_info = MigrationInformation {
+                    operation,
+                    mig_request_id,
+                    mig_info,
+                    reportdata,
+                    loglevel: [0; 8],
+                };
+
+                if REQUESTS.lock().contains(&mig_request_id) {
+                    Poll::Pending
+                } else {
+                    REQUESTS.lock().insert(mig_request_id);
+                    Poll::Ready(Ok(mig_info))
+                }
+            } else if operation == DataStatusOperation::EnableLogArea as u8 {
+                let mut mig_request_id: u64 = 0;
+                let mut logging: u64 = 0;
+                let expected_datalength = size_of_val(&mig_request_id) + size_of_val(&logging);
+
+                if data_length != expected_datalength as u32 {
+                    return Poll::Pending;
+                }
+
+                let slice = &data_buffer[12..12 + data_length as usize];
+                mig_request_id = u64::from_le_bytes(slice[0..8].try_into().unwrap());
+                logging = u64::from_le_bytes(slice[8..16].try_into().unwrap());
+
+                let mig_info = MigtdStartMigrationInformation {
+                    migration_source: 0,
+                    _pad: [0, 0, 0, 0, 0, 0, 0],
+                    target_td_uuid: [0, 0, 0, 0],
+                    binding_handle: 0,
+                };
+
+                let mig_info = MigrationInformation {
+                    operation,
+                    mig_request_id,
+                    mig_info,
+                    reportdata: [0; TD_REPORT_ADDITIONAL_DATA_SIZE],
+                    loglevel: logging.to_le_bytes(),
+                };
+
+                if REQUESTS.lock().contains(&mig_request_id) {
+                    Poll::Pending
+                } else {
+                    REQUESTS.lock().insert(mig_request_id);
+                    Poll::Ready(Ok(mig_info))
+                }
             } else {
-                REQUESTS.lock().insert(request_id);
-                Poll::Ready(Ok(mig_info))
+                Poll::Pending
             }
         })
         .await
@@ -331,16 +419,54 @@ pub fn shutdown() -> Result<()> {
 }
 
 #[cfg(feature = "vmcall-raw")]
-pub async fn report_status(status: u8, request_id: u64) -> Result<()> {
+pub async fn get_tdreport(
+    additional_data: &[u8; TD_REPORT_ADDITIONAL_DATA_SIZE],
+    data: &mut Vec<u8>,
+) -> Result<()> {
+    const TDVMCALL_TDREPORT: u64 = 0x00004;
+    let mut report_buf = TdxReportBuf(TdxReport::default());
+    let additional_data_buf = AdditionalDataBuf(*additional_data);
+    let tdreportsize = size_of::<TdxReport>();
+
+    let mut args = TdcallArgs {
+        rax: TDVMCALL_TDREPORT,
+        rcx: &mut report_buf as *mut _ as u64,
+        rdx: &additional_data_buf as *const _ as u64,
+        ..Default::default()
+    };
+
+    let ret = td_call(&mut args);
+    if ret != TDCALL_STATUS_SUCCESS {
+        return Err(MigrationResult::TdxModuleError);
+    }
+
+    data.extend_from_slice(report_buf.0.as_bytes());
+    if data.len() != tdreportsize {
+        return Err(MigrationResult::InvalidParameter);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vmcall-raw")]
+pub async fn report_status(status: u8, request_id: u64, data: &Vec<u8>) -> Result<()> {
     let data_status: u64 = 0;
-    let data_length: u32 = 0;
+    let mut data_length: u32 = 0;
 
     let mut data_buffer = SharedMemory::new(1).ok_or(MigrationResult::OutOfResource)?;
 
-    let data_buffer = data_buffer.as_mut_bytes();
+    if data.len() > 0 {
+        if data.len() > (PAGE_SIZE - 12) as usize {
+            return Err(MigrationResult::InvalidParameter);
+        }
+        data_length += data.len() as u32;
+    }
 
+    let data_buffer = data_buffer.as_mut_bytes();
     data_buffer[0..8].copy_from_slice(&u64::to_le_bytes(data_status));
     data_buffer[8..12].copy_from_slice(&u32::to_le_bytes(data_length));
+    if data.len() > 0 {
+        data_buffer[12..data.len() + 12].copy_from_slice(&data[0..data.len()]);
+    }
 
     tdx::tdvmcall_migtd_reportstatus(
         request_id,
@@ -590,7 +716,7 @@ pub async fn exchange_msk(info: &MigrationInformation) -> Result<()> {
     #[cfg(feature = "vmcall-raw")]
     {
         use vmcall_raw::stream::VmcallRaw;
-        let mut vmcall_raw_instance = VmcallRaw::new_with_mid(info.mig_info.mig_request_id)
+        let mut vmcall_raw_instance = VmcallRaw::new_with_mid(info.mig_request_id)
             .map_err(|_e| MigrationResult::InvalidParameter)?;
 
         vmcall_raw_instance
@@ -738,6 +864,7 @@ fn exchange_info(info: &MigrationInformation) -> Result<ExchangeInformation> {
     Ok(exchange_info)
 }
 
+#[cfg(not(feature = "vmcall-raw"))]
 fn read_msk(mig_info: &MigtdMigrationInformation, msk: &mut MigrationSessionKey) -> Result<()> {
     for idx in 0..msk.fields.len() {
         let ret = tdx::tdcall_servtd_rd(
@@ -750,7 +877,39 @@ fn read_msk(mig_info: &MigtdMigrationInformation, msk: &mut MigrationSessionKey)
     Ok(())
 }
 
+#[cfg(feature = "vmcall-raw")]
+fn read_msk(
+    mig_info: &MigtdStartMigrationInformation,
+    msk: &mut MigrationSessionKey,
+) -> Result<()> {
+    for idx in 0..msk.fields.len() {
+        let ret = tdx::tdcall_servtd_rd(
+            mig_info.binding_handle,
+            TDCS_FIELD_MIG_ENC_KEY + idx as u64,
+            &mig_info.target_td_uuid,
+        )?;
+        msk.fields[idx] = ret.content;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vmcall-raw"))]
 fn write_msk(mig_info: &MigtdMigrationInformation, msk: &MigrationSessionKey) -> Result<()> {
+    for idx in 0..msk.fields.len() {
+        tdx::tdcall_servtd_wr(
+            mig_info.binding_handle,
+            TDCS_FIELD_MIG_DEC_KEY + idx as u64,
+            msk.fields[idx],
+            &mig_info.target_td_uuid,
+        )
+        .map_err(|_| MigrationResult::TdxModuleError)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "vmcall-raw")]
+fn write_msk(mig_info: &MigtdStartMigrationInformation, msk: &MigrationSessionKey) -> Result<()> {
     for idx in 0..msk.fields.len() {
         tdx::tdcall_servtd_wr(
             mig_info.binding_handle,
