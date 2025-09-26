@@ -229,11 +229,22 @@ impl Default for MigrationSessionKey {
     }
 }
 
+#[cfg(feature = "vmcall-raw")]
+pub struct MigrationInformation {
+    pub operation: u8,
+    // ID for the migration request, which can be used in TDG.VP.VMCALL
+    // <Service.MigTD.ReportStatus>
+    pub mig_request_id: u64,
+    pub mig_info: MigtdStartMigrationInformation,
+    pub reportdata: [u8; 64],
+    pub loglevel: [u8; 8],
+}
+
+#[cfg(not(feature = "vmcall-raw"))]
 pub struct MigrationInformation {
     pub mig_info: MigtdMigrationInformation,
     #[cfg(any(feature = "vmcall-vsock", feature = "virtio-vsock"))]
     pub mig_socket_info: MigtdStreamSocketInfo,
-    #[cfg(not(feature = "vmcall-raw"))]
     pub mig_policy: Option<MigtdMigpolicy>,
 }
 

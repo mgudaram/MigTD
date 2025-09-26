@@ -97,6 +97,20 @@ pub struct MigtdMigrationInformation {
 
 #[repr(C)]
 #[derive(Debug, Pread, Pwrite)]
+pub struct MigtdStartMigrationInformation {
+    // If set, current MigTD is MigTD-s else current MigTD is MigTD-d
+    pub migration_source: u8,
+    _pad: [u8; 7],
+
+    // UUID of target TD
+    pub target_td_uuid: [u64; 4],
+
+    // Binding handle for the MigTD and the target TD
+    pub binding_handle: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Pread, Pwrite)]
 pub struct MigtdStreamSocketInfo {
     // Unique identifier for the communication between MigTD and VMM
     // It can be used in MigtdMigrationInformation Hob
@@ -143,6 +157,9 @@ pub enum MigrationResult {
     MutualAttestationError = 7,
     PolicyUnsatisfiedError = 8,
     InvalidPolicyError = 9,
+    VmmCanceled = 10,
+    VmmInternalError = 11,
+    UnsupportedOperationError = 12,
 }
 
 #[cfg(any(feature = "virtio-vsock", feature = "vmcall-vsock"))]

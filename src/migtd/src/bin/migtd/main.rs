@@ -10,6 +10,8 @@ extern crate alloc;
 use core::future::poll_fn;
 use core::task::Poll;
 
+#[cfg(feature = "vmcall-raw")]
+use alloc::vec::Vec;
 use log::info;
 use migtd::event_log::*;
 use migtd::migration::data::MigrationInformation;
@@ -187,22 +189,39 @@ fn handle_pre_mig() {
 
         if let Some(request) = new_request {
             async_runtime::add_task(async move {
-                let status = exchange_msk(&request)
-                    .await
-                    .map(|_| MigrationResult::Success)
-                    .unwrap_or_else(|e| e);
-
-                #[cfg(feature = "vmcall-raw")]
-                {
-                    let _ = report_status(status as u8, request.mig_info.mig_request_id).await;
-                }
-
                 #[cfg(not(feature = "vmcall-raw"))]
                 {
-                    let _ = report_status(status as u8, request.mig_info.mig_request_id);
-                }
+                    let status = exchange_msk(&request)
+                        .await
+                        .map(|_| MigrationResult::Success)
+                        .unwrap_or_else(|e| e);
 
-                REQUESTS.lock().remove(&request.mig_info.mig_request_id);
+                    let _ = report_status(status as u8, request.mig_info.mig_request_id);
+                    REQUESTS.lock().remove(&request.mig_info.mig_request_id);
+                }
+                #[cfg(feature = "vmcall-raw")]
+                {
+                    let mut data: Vec<u8> = Vec::new();
+                    if request.operation == DataStatusOperation::StartMigration as u8 {
+                        let status = exchange_msk(&request)
+                            .await
+                            .map(|_| MigrationResult::Success)
+                            .unwrap_or_else(|e| e);
+
+                        let _ = report_status(status as u8, request.mig_request_id, &data).await;
+                    } else if request.operation == DataStatusOperation::GetReportData as u8 {
+                        let status = get_tdreport(&request.reportdata, &mut data)
+                            .await
+                            .map(|_| MigrationResult::Success)
+                            .unwrap_or_else(|e| e);
+                        let _ = report_status(status as u8, request.mig_request_id, &data).await;
+                    } else if request.operation == DataStatusOperation::EnableLogArea as u8 {
+                        // TODO: support this feature
+                        let status = MigrationResult::UnsupportedOperationError;
+                        let _ = report_status(status as u8, request.mig_request_id, &data).await;
+                    }
+                    REQUESTS.lock().remove(&request.mig_request_id);
+                }
             });
         }
         sleep();
