@@ -9,6 +9,8 @@ use alloc::collections::BTreeSet;
 use async_io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "vmcall-raw")]
 use core::sync::atomic::AtomicBool;
+#[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+use core::sync::atomic::AtomicU32;
 #[cfg(any(feature = "vmcall-interrupt", feature = "vmcall-raw"))]
 use core::sync::atomic::Ordering;
 use core::{future::poll_fn, mem::size_of, task::Poll};
@@ -16,6 +18,8 @@ use core::{future::poll_fn, mem::size_of, task::Poll};
 use event::VMCALL_SERVICE_FLAG;
 use lazy_static::lazy_static;
 use spin::Mutex;
+#[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+use td_payload::mm::shared::alloc_shared_pages;
 use td_payload::mm::shared::SharedMemory;
 use tdx_tdcall::{
     td_call,
@@ -33,7 +37,7 @@ use crate::ratls;
 
 const TDCALL_STATUS_SUCCESS: u64 = 0;
 #[cfg(feature = "vmcall-raw")]
-const PAGE_SIZE: u64 = 0x1_000;
+const PAGE_SIZE: usize = 0x1_000;
 const TDCS_FIELD_MIG_DEC_KEY: u64 = 0x9810_0003_0000_0010;
 const TDCS_FIELD_MIG_ENC_KEY: u64 = 0x9810_0003_0000_0018;
 const TDCS_FIELD_MIG_VERSION: u64 = 0x9810_0001_0000_0020;
@@ -42,6 +46,12 @@ const GSM_FIELD_MIN_EXPORT_VERSION: u64 = 0x2000000100000001;
 const GSM_FIELD_MAX_EXPORT_VERSION: u64 = 0x2000000100000002;
 const GSM_FIELD_MIN_IMPORT_VERSION: u64 = 0x2000000100000003;
 const GSM_FIELD_MAX_IMPORT_VERSION: u64 = 0x2000000100000004;
+
+#[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+static NUM_VCPUS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+static LOGAREA_CREATED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "vmcall-raw")]
 #[repr(C, align(1024))]
@@ -65,6 +75,38 @@ pub enum DataStatusOperation {
 }
 
 #[cfg(feature = "vmcall-raw")]
+fn u8_to_migration_result(value: u8) -> Option<MigrationResult> {
+    match value {
+        0 => Some(MigrationResult::Success),
+        1 => Some(MigrationResult::InvalidParameter),
+        2 => Some(MigrationResult::Unsupported),
+        3 => Some(MigrationResult::OutOfResource),
+        4 => Some(MigrationResult::TdxModuleError),
+        5 => Some(MigrationResult::NetworkError),
+        6 => Some(MigrationResult::SecureSessionError),
+        7 => Some(MigrationResult::MutualAttestationError),
+        8 => Some(MigrationResult::PolicyUnsatisfiedError),
+        9 => Some(MigrationResult::InvalidPolicyError),
+        10 => Some(MigrationResult::VmmCanceled),
+        11 => Some(MigrationResult::VmmInternalError),
+        12 => Some(MigrationResult::UnsupportedOperationError),
+        _ => None, // Handle cases where the u8 doesn't map to a valid Level
+    }
+}
+
+#[cfg(feature = "vmcall-raw")]
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogMaxLevel {
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+#[cfg(feature = "vmcall-raw")]
 fn parse_uuid(buf: &[u8]) -> [u64; 4] {
     [
         u64::from_le_bytes(buf[0..8].try_into().unwrap()),
@@ -76,6 +118,7 @@ fn parse_uuid(buf: &[u8]) -> [u64; 4] {
 
 lazy_static! {
     pub static ref REQUESTS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+    pub static ref LOGAREAPTR: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 }
 
 struct ExchangeInformation {
@@ -447,30 +490,107 @@ pub async fn get_tdreport(
     Ok(())
 }
 
+#[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+pub fn create_logarea() -> Result<()> {
+    const TDVMCALL_TDINFO: u64 = 0x00001;
+    let mut args = TdcallArgs {
+        rax: TDVMCALL_TDINFO,
+        ..Default::default()
+    };
+
+    let ret = td_call(&mut args);
+    if ret != TDCALL_STATUS_SUCCESS {
+        return Err(MigrationResult::TdxModuleError);
+    }
+
+    let num_vcpus = args.r8 as u32;
+
+    NUM_VCPUS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            v.checked_add(num_vcpus)
+        })
+        .unwrap();
+    let mut logareavector = LOGAREAPTR.lock();
+    for _index in 0..num_vcpus {
+        let data_buffer = unsafe { alloc_shared_pages(1).ok_or(MigrationResult::OutOfResource)? };
+        logareavector.push(data_buffer);
+    }
+    LOGAREA_CREATED.store(true, Ordering::SeqCst);
+
+    Ok(())
+}
+
+#[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+pub async fn enable_logarea(loglevel: &[u8; 8], data: &mut Vec<u8>) -> Result<()> {
+    let padding: u32 = 0;
+    let num_vcpus: u32 = NUM_VCPUS.load(Ordering::SeqCst);
+    let logarea_created: bool = LOGAREA_CREATED.load(Ordering::SeqCst);
+
+    if !logarea_created {
+        return Err(MigrationResult::UnsupportedOperationError);
+    }
+
+    if loglevel[0] > LogMaxLevel::Trace as u8 {
+        return Err(MigrationResult::InvalidParameter);
+    }
+
+    data.extend_from_slice(&num_vcpus.to_le_bytes());
+    data.extend_from_slice(&padding.to_le_bytes());
+    let logareavector = LOGAREAPTR.lock();
+    for index in 0..num_vcpus {
+        let data_buffer = logareavector[index as usize];
+        let data_buffer =
+            unsafe { core::slice::from_raw_parts_mut(data_buffer as *mut u8, PAGE_SIZE) };
+        let data_buffer_as_u64 = data_buffer.as_ptr() as u64;
+        data_buffer[0..16].copy_from_slice(&LOGAREA_SIGNATURE);
+        data_buffer[16..20].copy_from_slice(&index.to_le_bytes());
+        data_buffer[20..24].copy_from_slice(&padding.to_le_bytes());
+        let logdataoffset = size_of_val(&LOGAREA_SIGNATURE)
+            + size_of_val(&index)
+            + size_of_val(&padding)
+            + (2 * size_of::<u64>() as usize);
+        data_buffer[24..32].copy_from_slice(&logdataoffset.to_le_bytes());
+        data_buffer[32..40].copy_from_slice(&logdataoffset.to_le_bytes());
+        data.extend_from_slice(&data_buffer_as_u64.to_le_bytes());
+        data.extend_from_slice(&PAGE_SIZE.to_le_bytes());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "vmcall-raw")]
 pub async fn report_status(status: u8, request_id: u64, data: &Vec<u8>) -> Result<()> {
     let data_status: u64 = 0;
+    let mut reportstatus = ReportStatusResponse::new()
+        .with_pre_migration_status(0)
+        .with_error_code(0)
+        .with_reserved(0);
     let mut data_length: u32 = 0;
-
     let mut data_buffer = SharedMemory::new(1).ok_or(MigrationResult::OutOfResource)?;
 
-    if data.len() > 0 {
-        if data.len() > (PAGE_SIZE - 12) as usize {
-            return Err(MigrationResult::InvalidParameter);
+    if let Some(value) = u8_to_migration_result(status) {
+        if value != MigrationResult::Success {
+            reportstatus = reportstatus
+                .with_pre_migration_status(1)
+                .with_error_code(status);
         }
+    } else {
+        return Err(MigrationResult::InvalidParameter);
+    }
+
+    if data.len() > 0 && data.len() < (PAGE_SIZE - 12) {
         data_length += data.len() as u32;
     }
 
     let data_buffer = data_buffer.as_mut_bytes();
     data_buffer[0..8].copy_from_slice(&u64::to_le_bytes(data_status));
     data_buffer[8..12].copy_from_slice(&u32::to_le_bytes(data_length));
-    if data.len() > 0 {
+    if data.len() > 0 && data.len() < (PAGE_SIZE - 12) {
         data_buffer[12..data.len() + 12].copy_from_slice(&data[0..data.len()]);
     }
 
     tdx::tdvmcall_migtd_reportstatus(
         request_id,
-        status,
+        reportstatus.into(),
         data_buffer,
         event::VMCALL_SERVICE_VECTOR,
     )?;

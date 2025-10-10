@@ -43,6 +43,7 @@ vmcall_raw = { path="../devices/vmcall_raw", optional = true }
 x86 = "0.47.0"
 x86_64 = { version = "0.14", default-features = false, features = ["instructions"] }
 zerocopy = { version = "0.7", features = ["derive"] }
+bitfield-struct = "0.11"
 
 minicov = { version = "0.2", default-features = false, optional = true }
 td-benchmark = { path = "../../deps/td-shim/devtools/td-benchmark", default-features = false,  optional = true }
@@ -60,6 +61,7 @@ vmcall-interrupt = []
 vmcall-vsock = ["vsock/vmcall-vsock"]
 vmcall-raw = ["vmcall_raw"]
 oneshot-apic = []
+enable-logging = []
 test_heap_size = ["td-benchmark", "td-payload/test_heap_size"]
 test_stack_size = ["td-benchmark"]
 test_disable_ra_and_accept_all = ["attestation/test"] # Dangerous: can only be used for test purpose to bypass the remote attestation

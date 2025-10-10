@@ -34,6 +34,12 @@ pub extern "C" fn main() {
 pub fn runtime_main() {
     let _ = td_logger::init();
 
+    // Create LogArea per vCPU
+    #[cfg(all(feature = "vmcall-raw", feature = "enable-logging"))]
+    {
+        let _ = create_logarea();
+    }
+
     // Dump basic information of MigTD
     basic_info();
 
@@ -207,7 +213,6 @@ fn handle_pre_mig() {
                             .await
                             .map(|_| MigrationResult::Success)
                             .unwrap_or_else(|e| e);
-
                         let _ = report_status(status as u8, request.mig_request_id, &data).await;
                     } else if request.operation == DataStatusOperation::GetReportData as u8 {
                         let status = get_tdreport(&request.reportdata, &mut data)
@@ -216,8 +221,13 @@ fn handle_pre_mig() {
                             .unwrap_or_else(|e| e);
                         let _ = report_status(status as u8, request.mig_request_id, &data).await;
                     } else if request.operation == DataStatusOperation::EnableLogArea as u8 {
-                        // TODO: support this feature
+                        #[cfg(not(feature = "enable-logging"))]
                         let status = MigrationResult::UnsupportedOperationError;
+                        #[cfg(feature = "enable-logging")]
+                        let status = enable_logarea(&request.loglevel, &mut data)
+                            .await
+                            .map(|_| MigrationResult::Success)
+                            .unwrap_or_else(|e| e);
                         let _ = report_status(status as u8, request.mig_request_id, &data).await;
                     }
                     REQUESTS.lock().remove(&request.mig_request_id);

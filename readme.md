@@ -122,9 +122,17 @@ To use vmcall-raw for the guest-host communication:
 cargo image --no-default-features --features stack-guard,vmcall-raw
 ```
 
-To generate IGVM format using vmcall-raw for the guest-host communication with logging enabled and support APIC oneshot timer if TSC deadline is unavailable:
+To generate MigTD on windows:
+--features:
+[
+  vmcall-raw        : enables vmcall-raw for the guest-host communication
+  oneshot-apic      : support APIC oneshot timer if TSC deadline is unavailable
+  enable-logging    : enables logging via LogArea in shared memory for VMM
+]
+--log-level info    : enables logging for serial console with max loglevel set to "INFO"
+--image-format igvm : to generate MigTD in IGVM format
 ```
-cargo image --no-default-features --features vmcall-raw,stack-guard,main,test_disable_ra_and_accept_all,vmcall-interrupt,oneshot-apic --log-level info --image-format igvm
+cargo image --no-default-features --features vmcall-raw,stack-guard,main,test_disable_ra_and_accept_all,vmcall-interrupt,oneshot-apic,enable-logging --log-level info --image-format igvm
 ```
 
 ### Generate SERVTD_INFO_HASH

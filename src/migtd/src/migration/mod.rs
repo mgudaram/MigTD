@@ -109,6 +109,10 @@ pub struct MigtdStartMigrationInformation {
     pub binding_handle: u64,
 }
 
+pub const LOGAREA_SIGNATURE: [u8; 16] = [
+    0x4d, 0x69, 0x67, 0x54, 0x44, 0x20, 0x4c, 0x6f, 0x67, 0x41, 0x72, 0x65, 0x61, 0x20, 0x31, 0x00,
+];
+
 #[repr(C)]
 #[derive(Debug, Pread, Pwrite)]
 pub struct MigtdStreamSocketInfo {
@@ -146,6 +150,7 @@ pub struct MigtdMigpolicy {
 }
 
 #[repr(u8)]
+#[derive(PartialEq)]
 pub enum MigrationResult {
     Success = 0,
     InvalidParameter = 1,
