@@ -10,6 +10,7 @@ required-features = ["main"]
 
 [dev-dependencies]
 attestation = { path = "../attestation", default-features = false, features = ["test"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dependencies]
 bitfield = "0.13.2"

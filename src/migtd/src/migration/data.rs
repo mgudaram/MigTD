@@ -382,6 +382,7 @@ fn create_migration_information(
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "vmcall-raw"))]
 mod test {
     use super::*;
     use crate::migration::VMCALL_SERVICE_COMMON_GUID;

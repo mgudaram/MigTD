@@ -6,12 +6,14 @@
 
 use crate::migration::MigrationResult;
 use alloc::vec::Vec;
+use alloc::format;
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use lazy_static::lazy_static;
 use log::Level;
 use raw_cpuid::CpuId;
 use spin::Mutex;
-use td_payload::mm::shared::alloc_shared_pages;
+use td_payload::mm::shared::{alloc_shared_pages};
 use tdx_tdcall::{td_call, TdcallArgs};
 use zerocopy::{transmute_ref, AsBytes, FromBytes, FromZeroes};
 const PAGE_SIZE: usize = 0x1_000;
@@ -95,30 +97,45 @@ lazy_static! {
 }
 
 pub fn create_logarea() -> Result<()> {
-    const TDVMCALL_TDINFO: u64 = 0x00001;
-    let mut args = TdcallArgs {
-        rax: TDVMCALL_TDINFO,
-        ..Default::default()
-    };
+    let num_vcpus: u32;
+    #[cfg(not(test))]
+    {
+        const TDVMCALL_TDINFO: u64 = 0x00001;
+        let mut args = TdcallArgs {
+            rax: TDVMCALL_TDINFO,
+            ..Default::default()
+        };
 
-    let ret = td_call(&mut args);
-    if ret != TDCALL_STATUS_SUCCESS {
-        return Err(MigrationResult::TdxModuleError);
+        let ret = td_call(&mut args);
+        if ret != TDCALL_STATUS_SUCCESS {
+            return Err(MigrationResult::TdxModuleError);
+        }
+
+        num_vcpus = args.r8 as u32;
+
+        let mut logareavector = LOGAREAPTR.lock();
+        for _index in 0..num_vcpus {
+            let data_buffer = unsafe { alloc_shared_pages(1).ok_or(MigrationResult::OutOfResource)? };
+            logareavector.push(data_buffer);
+        }
+
     }
-
-    let num_vcpus = args.r8 as u32;
+    #[cfg(test)]
+    {
+        num_vcpus = 1;
+        let mut logareavector = LOGAREAPTR.lock();
+        let databuffer: Box<[u8; PAGE_SIZE]> = Box::new([0; PAGE_SIZE]);
+        let databuffer_ptr = Box::into_raw(databuffer) as *mut u8;
+        logareavector.push(databuffer_ptr as usize);
+    }
 
     LOGGING_INFORMATION
-        .num_vcpus
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-            v.checked_add(num_vcpus)
-        })
-        .unwrap();
-    let mut logareavector = LOGAREAPTR.lock();
-    for _index in 0..num_vcpus {
-        let data_buffer = unsafe { alloc_shared_pages(1).ok_or(MigrationResult::OutOfResource)? };
-        logareavector.push(data_buffer);
-    }
+    .num_vcpus
+    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        v.checked_add(num_vcpus)
+    })
+    .unwrap();
+
     LOGGING_INFORMATION
         .logarea_created
         .store(true, Ordering::SeqCst);
@@ -147,43 +164,73 @@ pub async fn enable_logarea(log_max_level: u8, request_id: u64, data: &mut Vec<u
             .unwrap();
         data.extend_from_slice(&num_vcpus.to_le_bytes());
         data.extend_from_slice(&padding.to_le_bytes());
-        for index in 0..num_vcpus {
+        #[cfg(not(test))]
+        {
+            for index in 0..num_vcpus {
+                let logareavector = LOGAREAPTR.lock();
+                let data_buffer = logareavector[index as usize];
+                let data_buffer =
+                    unsafe { core::slice::from_raw_parts_mut(data_buffer as *mut u8, PAGE_SIZE) };
+                let data_buffer_as_u64 = data_buffer.as_ptr() as u64;
+                if !logarea_initialized {
+                    let logareabuffheader = LogAreaBufferHeader {
+                        signature: LOGAREA_SIGNATURE,
+                        vcpuindex: index,
+                        reserved: 0,
+                        startoffset: size_of::<LogAreaBufferHeader>() as u64,
+                        endoffset: size_of::<LogAreaBufferHeader>() as u64,
+                    };
+                    let bytes: &[u8] = logareabuffheader.as_bytes();
+                    data_buffer[0..size_of::<LogAreaBufferHeader>()]
+                        .copy_from_slice(&bytes[0..bytes.len()]);
+                    LOGGING_INFORMATION
+                        .logarea_initialized
+                        .store(true, Ordering::SeqCst);
+                }
+                data.extend_from_slice(&data_buffer_as_u64.to_le_bytes());
+                data.extend_from_slice(&PAGE_SIZE.to_le_bytes());
+            }
+            
+            log::info!(
+                "enable_logarea: Logging has been enabled with MaxLevel: {}\n",
+                log_max_level
+            );
+            entrylog(
+                &format!(
+                    "enable_logarea: Logging has been enabled with MaxLevel: {}\n",
+                    log_max_level
+                )
+                .into_bytes(),
+                Level::Info,
+                request_id,
+            );
+        }
+        #[cfg(test)]
+        {
             let logareavector = LOGAREAPTR.lock();
-            let data_buffer = logareavector[index as usize];
+            let data_buffer = logareavector[0] as *mut u8;
             let data_buffer =
-                unsafe { core::slice::from_raw_parts_mut(data_buffer as *mut u8, PAGE_SIZE) };
+                    unsafe { core::slice::from_raw_parts_mut(data_buffer, PAGE_SIZE) };
             let data_buffer_as_u64 = data_buffer.as_ptr() as u64;
             if !logarea_initialized {
-                let logareabuffheader = LogAreaBufferHeader {
-                    signature: LOGAREA_SIGNATURE,
-                    vcpuindex: index,
-                    reserved: 0,
-                    startoffset: size_of::<LogAreaBufferHeader>() as u64,
-                    endoffset: size_of::<LogAreaBufferHeader>() as u64,
-                };
-                let bytes: &[u8] = logareabuffheader.as_bytes();
-                data_buffer[0..size_of::<LogAreaBufferHeader>()]
-                    .copy_from_slice(&bytes[0..bytes.len()]);
-                LOGGING_INFORMATION
-                    .logarea_initialized
-                    .store(true, Ordering::SeqCst);
-            }
+                    let logareabuffheader = LogAreaBufferHeader {
+                        signature: LOGAREA_SIGNATURE,
+                        vcpuindex: 0,
+                        reserved: 0,
+                        startoffset: size_of::<LogAreaBufferHeader>() as u64,
+                        endoffset: size_of::<LogAreaBufferHeader>() as u64,
+                    };
+                    let bytes: &[u8] = logareabuffheader.as_bytes();
+                    data_buffer[0..size_of::<LogAreaBufferHeader>()]
+                        .copy_from_slice(&bytes[0..bytes.len()]);
+                    LOGGING_INFORMATION
+                        .logarea_initialized
+                        .store(true, Ordering::SeqCst);
+                }
             data.extend_from_slice(&data_buffer_as_u64.to_le_bytes());
             data.extend_from_slice(&PAGE_SIZE.to_le_bytes());
         }
-        log::info!(
-            "enable_logarea: Logging has been enabled with MaxLevel: {}\n",
-            log_max_level
-        );
-        entrylog(
-            &format!(
-                "enable_logarea: Logging has been enabled with MaxLevel: {}\n",
-                log_max_level
-            )
-            .into_bytes(),
-            Level::Info,
-            request_id,
-        );
+        
         Ok(())
     } else {
         entrylog(
@@ -273,5 +320,48 @@ pub fn entrylog(msg: &Vec<u8>, loglevel: Level, request_id: u64) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use log::Level;
+    use core::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn test_entrylog() {
+        let mut data: Vec<u8> = Vec::new();
+        let mut result = create_logarea();
+        let mut log_max_level: u8 = 5;
+
+        assert!(result.is_ok());
+        assert!(matches!(LOGGING_INFORMATION.num_vcpus.load(Ordering::SeqCst), 1));
+        assert!(matches!(LOGGING_INFORMATION.logarea_created.load(Ordering::SeqCst), true));
+
+        // Test utility functions
+        assert_eq!(loglevel_to_u8(Level::Error), 1);
+        assert_eq!(loglevel_to_u8(Level::Info), 3);
+        
+        // Test that u8_to_loglevel works
+        assert_eq!(u8_to_loglevel(3), Some(Level::Info));
+        assert_eq!(u8_to_loglevel(99), None);
+
+        result = enable_logarea(
+                                log_max_level,
+                                0,
+                                &mut data,
+                            )
+                            .await;
+        assert!(result.is_ok());
+        entrylog(
+            &format!(
+                "enable_logarea: Logging has been enabled with MaxLevel: {}\n",
+                log_max_level
+            )
+            .into_bytes(),
+            Level::Info,
+            0,
+        );
     }
 }
