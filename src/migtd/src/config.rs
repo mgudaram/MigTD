@@ -41,7 +41,9 @@ pub fn get_config_volume() -> &'static [u8] {
 }
 
 pub fn get_policy() -> Option<&'static [u8]> {
+    log::info!("config: get_policy() beginning");
     let cfv = get_config_volume();
+    log::info!("config: get_policy() after cvf");
     fv::get_file_from_fv(cfv, pi::fv::FV_FILETYPE_RAW, MIGTD_POLICY_FFS_GUID)
 }
 
@@ -52,6 +54,7 @@ pub fn get_root_ca() -> Option<&'static [u8]> {
 
 pub fn get_policy_issuer_chain() -> Option<&'static [u8]> {
     let cfv = get_config_volume();
+    log::info!("config: get_policy_issuer_chain() after cvf");
     fv::get_file_from_fv(
         cfv,
         pi::fv::FV_FILETYPE_RAW,

@@ -342,8 +342,11 @@ pub(super) async fn exchange_hello_packet<T: AsyncRead + AsyncWrite + Unpin>(
 /// Format: `[u32 LE policy_len][policy][u32 LE chain_len][issuer_chain]`.
 /// Returns `None` if either length exceeds `u32::MAX`.
 pub(crate) fn encode_peer_data(policy: &[u8], issuer_chain: &[u8]) -> Option<Vec<u8>> {
+    log::info!("pre_session_data: encode_peer_data beginning");
     let policy_len = u32::try_from(policy.len()).ok()?;
+    log::info!("pre_session_data: encode_peer_data policy_len {:x}", policy_len);
     let chain_len = u32::try_from(issuer_chain.len()).ok()?;
+    log::info!("pre_session_data: encode_peer_data chain_len {:x}", chain_len);
 
     let mut blob = Vec::with_capacity(8 + policy.len() + issuer_chain.len());
     blob.extend_from_slice(&policy_len.to_le_bytes());
@@ -384,8 +387,11 @@ pub(crate) fn decode_peer_data(data: &[u8]) -> Option<(&[u8], &[u8])> {
 /// Build the local peer-data blob from configured policy and issuer chain.
 #[cfg(feature = "policy_v2")]
 pub(crate) fn local_peer_data() -> Option<Vec<u8>> {
+    log::info!("pre_session_data: local_peer_data beginning");
     let policy = crate::config::get_policy()?;
+    log::info!("pre_session_data: local_peer_data after get_policy()");
     let issuer_chain = crate::config::get_policy_issuer_chain()?;
+    log::info!("pre_session_data: local_peer_data after get_policy_issuer_chain()");
     encode_peer_data(policy, issuer_chain)
 }
 
